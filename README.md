@@ -1,4 +1,4 @@
-XGBoost 0.0956175
+# XGBoost 0.0956175
 
 以 XGBoost 建立帳戶層級的風險二元分類模型。流程分三段：
 
@@ -10,11 +10,11 @@ XGBoost 0.0956175
 
 0. 需求與安裝
 
-Python 3.9+
+ Python 3.9+
 
-套件：
+ 套件：
 
-pip install pandas numpy xgboost scikit-learn joblib
+ pip install pandas numpy xgboost scikit-learn joblib
 
 
 （選配）GPU 訓練：安裝可用 CUDA 的 xgboost
