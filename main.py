@@ -87,16 +87,26 @@ def write_submission_final(submission_path: str, final_path: str):
 def main():
     parser = argparse.ArgumentParser(description="AI CUP Orchestrator (XGB)")
     parser.add_argument("--features", default="feature_data/account_features.csv")
-    parser.add_argument("--alerts", default="dataset/acct_alert.csv")
-    parser.add_argument("--outdir", default="outputs")
+    parser.add_argument("--alerts",   default="dataset/acct_alert.csv")
+    parser.add_argument("--outdir",   default="outputs")
 
-    parser.add_argument("--train-csv", default="working/train.csv")
-    parser.add_argument("--test-csv", default=None)
+    parser.add_argument("--train-csv",  default="working/train.csv")
+    parser.add_argument("--test-csv",   default=None)
     parser.add_argument("--skip-prepare", action="store_true", help="略過由 features+alerts 產生 train.csv")
 
     parser.add_argument("--model-path", default="model_xgb.joblib")
     parser.add_argument("--predict-only", action="store_true", help="只做推論")
     parser.add_argument("--eval", action="store_true", help="推論後用 acct_alert.csv 計算本地 F1")
+
+    # 推論控制（與 model_xgb.predict 對齊）
+    parser.add_argument("--target-pos-rate", type=float, default=None,
+                        help="指定目標陽性率（例如 0.002 代表 0.2%），將以分位數覆寫 threshold")
+    parser.add_argument("--min-positives", type=int, default=1,
+                        help="保底最少陽性數（Top-K 強制置 1）")
+    parser.add_argument("--extra-thresholds", type=str, default="0.5,0.3,0.2,0.1",
+                        help="額外檢視的 threshold 清單，逗號分隔")
+    parser.add_argument("--topk-show", type=int, default=10,
+                        help="診斷印出機率最高的前 K 筆")
 
     args = parser.parse_args()
     Path("working").mkdir(exist_ok=True)
@@ -112,7 +122,28 @@ def main():
 
     test_csv = decide_test_csv(args)
     submission_path = str(outdir / "submission.csv")
-    predict(test_csv, args.model_path, submission_path)
+
+    # 解析 extra thresholds
+    thr_list = []
+    if args.extra_thresholds:
+        for t in args.extra_thresholds.split(","):
+            t = t.strip()
+            if t:
+                try:
+                    thr_list.append(float(t))
+                except Exception:
+                    pass
+
+    # 推論
+    predict(
+        test_path=test_csv,
+        model_path=args.model_path,
+        output_path=submission_path,
+        thresholds=thr_list if thr_list else None,
+        topk_show=args.topk_show,
+        target_pos_rate=args.target_pos_rate,
+        min_positives=args.min_positives,
+    )
     print(f"✅ 完成推論，提交檔已輸出：{submission_path}")
 
     # 產生兩欄的提交檔（平台可交）

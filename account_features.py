@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
 
-# ====== 嘗試啟用 RAPIDS cuDF（GPU 加速）======
+# 可選 GPU：RAPIDS cuDF（若環境安裝 & 有 GPU）
 try:
     import cudf  # type: ignore
     _HAS_CUDF = True
@@ -16,9 +16,7 @@ except Exception:
     _HAS_CUDF = False
 
 
-# -----------------------
-# 欄位偵測
-# -----------------------
+# ============ 小工具 ============
 def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     for c in candidates:
         if c in df.columns:
@@ -26,225 +24,192 @@ def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
-def _detect_schema(df: pd.DataFrame) -> Tuple[str, str, str, Optional[str], Optional[str], Optional[str]]:
+def _detect_schema(df: pd.DataFrame) -> Tuple[str, str, str,
+                                              Optional[str], Optional[str], Optional[str],
+                                              Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
-    偵測欄位:
-      from_acct / to_acct / 金額 / 日期 / 時間 / 來源(管道)
-    會盡量對齊你給的 schema:
-      from_acct, from_acct_type, to_acct, to_acct_type, is_self_txn,
-      txn_amt, txn_date, txn_time, currency_type, channel_type
+    偵測欄位：
+      必要：from / to / amount
+      可選：date / time / datetime / channel / currency / from_acct_type / to_acct_type / is_self_txn
     """
     from_col = _find_col(df, ["from_acct", "from", "src_acct", "sender", "payer"])
     to_col   = _find_col(df, ["to_acct", "to", "dst_acct", "receiver", "payee"])
     amt_col  = _find_col(df, ["txn_amt", "amount", "amt", "money", "value"])
+
     date_col = _find_col(df, ["txn_date", "date"])
-    time_col = _find_col(df, ["txn_time", "time", "ts", "timestamp", "datetime"])
-    src_col  = _find_col(df, ["channel_type", "source", "channel", "src", "method"])
+    time_col = _find_col(df, ["txn_time", "time"])
+    dt_col   = _find_col(df, ["txn_datetime", "datetime", "timestamp", "ts"])
+
+    channel_col  = _find_col(df, ["channel_type", "channel", "source", "method"])
+    currency_col = _find_col(df, ["currency_type", "currency", "curr"])
+    from_type    = _find_col(df, ["from_acct_type", "from_type", "src_type"])
+    to_type      = _find_col(df, ["to_acct_type", "to_type", "dst_type"])
+    self_col     = _find_col(df, ["is_self_txn", "is_self", "self_txn"])
 
     if not (from_col and to_col and amt_col):
-        raise ValueError("交易檔需至少包含 from_acct / to_acct / amount（含常見同義字）")
+        raise ValueError("交易檔需包含 from_acct / to_acct / txn_amt（或同義欄位）。")
 
-    return from_col, to_col, amt_col, date_col, time_col, src_col
+    return from_col, to_col, amt_col, date_col, time_col, dt_col, channel_col, currency_col, from_type, to_type, self_col
 
 
-def _build_timestamp(df: pd.DataFrame, date_col: Optional[str], time_col: Optional[str]) -> Optional[str]:
+def _coerce_bool01(s: pd.Series) -> pd.Series:
     """
-    盡量組合 datetime 欄位：
-      - 同時有日期與時間 => 合併為一個 'ts'
-      - 只有一個 => 直接轉 'ts'
-      - 都沒有 => 回傳 None
+    把各式表示轉成 0/1：
+    'Y/Yes/True/1' -> 1；'N/No/False/0' -> 0；其餘/NaN -> 0
     """
-    if date_col is None and time_col is None:
-        return None
-
-    if date_col is not None and time_col is not None:
-        ts = pd.to_datetime(df[date_col].astype(str) + " " + df[time_col].astype(str), errors="coerce")
-    else:
-        # 只靠單一欄位轉
-        col = date_col if date_col is not None else time_col
-        ts = pd.to_datetime(df[col], errors="coerce")
-
-    df["ts"] = ts
-    return "ts"
+    if s.dtype.kind in ("i", "u", "b", "f"):
+        return (pd.to_numeric(s, errors="coerce").fillna(0) != 0).astype("int32")
+    m = {"y": 1, "yes": 1, "true": 1, "t": 1, "1": 1,
+         "n": 0, "no": 0,  "false": 0, "f": 0, "0": 0}
+    return s.astype(str).str.strip().str.lower().map(m).fillna(0).astype("int32")
 
 
-# -----------------------
-# Pandas 聚合（CPU 後備）
-# -----------------------
-def _pd_group_amount_block(g: pd.core.groupby.generic.SeriesGroupBy, prefix: str) -> pd.DataFrame:
-    basic = g.agg(["size", "sum", "mean", "std", "min", "max"]).rename(columns={
-        "size": f"{prefix}_txn_count",
-        "sum":  f"{prefix}_amt_sum",
-        "mean": f"{prefix}_amt_mean",
-        "std":  f"{prefix}_amt_std",
-        "min":  f"{prefix}_amt_min",
-        "max":  f"{prefix}_amt_max",
+def _combine_datetime(df: pd.DataFrame,
+                      date_col: Optional[str], time_col: Optional[str], dt_col: Optional[str],
+                      fmt_date: Optional[str], fmt_time: Optional[str], fmt_datetime: Optional[str]) -> Optional[pd.Series]:
+    """
+    解析時間（盡量避免 pandas 警告）：
+      1) 若有 dt_col 且給了 fmt_datetime，先用它；失敗就退回寬鬆解析
+      2) 否則若有 date+time，先用 fmt_date+fmt_time；失敗就退回寬鬆解析
+      3) 否則回 None
+    """
+    if dt_col and dt_col in df.columns:
+        if fmt_datetime:
+            try:
+                return pd.to_datetime(df[dt_col], format=fmt_datetime, errors="raise")
+            except Exception:
+                pass
+        return pd.to_datetime(df[dt_col], errors="coerce")
+
+    if date_col and time_col and (date_col in df.columns) and (time_col in df.columns):
+        if fmt_date and fmt_time:
+            try:
+                return pd.to_datetime(df[date_col].astype(str) + " " + df[time_col].astype(str),
+                                      format=f"{fmt_date} {fmt_time}", errors="raise")
+            except Exception:
+                pass
+        return pd.to_datetime(df[date_col].astype(str) + " " + df[time_col].astype(str), errors="coerce")
+
+    return None
+
+
+def _group_amt_block_pd(df: pd.DataFrame, key: str, amt_col: str, prefix: str) -> pd.DataFrame:
+    g = df.groupby(key, sort=False)[amt_col]
+    basic = g.agg(['size', 'sum', 'mean', 'std', 'min', 'max']).rename(columns={
+        'size': f"{prefix}_txn_count",
+        'sum':  f"{prefix}_amt_sum",
+        'mean': f"{prefix}_amt_mean",
+        'std':  f"{prefix}_amt_std",
+        'min':  f"{prefix}_amt_min",
+        'max':  f"{prefix}_amt_max",
     })
-    # 分位數（在 GPU 路徑為求穩定與速度省略；CPU 路徑保留）
     q = g.quantile([0.5, 0.9, 0.99]).unstack()
     q.columns = [f"{prefix}_amt_p{int(qv*100)}" for qv in q.columns]
     return basic.join(q, how="left")
 
 
-# -----------------------
-# cuDF 聚合（GPU 快速）
-# -----------------------
-def _cdf_group_agg(gdf: "cudf.DataFrame", key: str, amt_col: str,
-                   is_night_col: str, is_wkend_col: str, is_self_col: str,
-                   counterparty_col: str, src_col: Optional[str],
-                   prefix: str) -> pd.DataFrame:
+def _group_amt_block_gpu(df: pd.DataFrame, key: str, amt_col: str, prefix: str) -> pd.DataFrame:
     """
-    使用 cuDF 做高速聚合：count / sum / mean / std / min / max / 各種 nunique / sum of flags
-    注意：為了速度與穩定性，這裡不計算分位數（p50/p90/p99）。
+    GPU 加速：size/sum/mean/std/min/max 用 cuDF；quantile 保留在 pandas（準確）
     """
-    agg_dict = {
-        amt_col: ["count", "sum", "mean", "std", "min", "max"],
-        is_night_col: ["sum"],
-        is_wkend_col: ["sum"],
-        is_self_col: ["sum"],
-        counterparty_col: ["nunique"],
-    }
-    if src_col:
-        agg_dict[src_col] = ["nunique"]
+    gdf = cudf.from_pandas(df[[key, amt_col]])
+    gb = gdf.groupby(key)
+    basic = gb.agg({amt_col: ["count", "sum", "mean", "std", "min", "max"]}).reset_index().to_pandas()
+    basic.columns = [key, f"{prefix}_txn_count", f"{prefix}_amt_sum", f"{prefix}_amt_mean",
+                     f"{prefix}_amt_std", f"{prefix}_amt_min", f"{prefix}_amt_max"]
+    basic = basic.set_index(key)
 
-    got = gdf.groupby(key).agg(agg_dict)
-
-    # 攤平 MultiIndex 欄名並加上 prefix
-    got = got.to_pandas()
-    got.columns = [
-        f"{prefix}_{c2 if c2!='count' else 'txn_count'}" if c1 == amt_col
-        else (f"{prefix}_night_txn_count" if c1 == is_night_col
-              else f"{prefix}_weekend_txn_count" if c1 == is_wkend_col
-              else f"{prefix}_self_txn_count" if c1 == is_self_col
-              else f"{prefix}_unique_to_acct" if c1 == counterparty_col and c2 == "nunique"
-              else (f"{prefix}_source_nunique" if src_col and c1 == src_col and c2 == "nunique" else f"{prefix}_{c1}_{c2}"))
-        for (c1, c2) in got.columns
-    ]
-
-    # 重新命名金額統計欄位：sum/mean/std/min/max
-    ren = {
-        f"{prefix}_{amt_col}_sum":  f"{prefix}_amt_sum",
-        f"{prefix}_{amt_col}_mean": f"{prefix}_amt_mean",
-        f"{prefix}_{amt_col}_std":  f"{prefix}_amt_std",
-        f"{prefix}_{amt_col}_min":  f"{prefix}_amt_min",
-        f"{prefix}_{amt_col}_max":  f"{prefix}_amt_max",
-    }
-    if f"{prefix}_{amt_col}_txn_count" in got.columns:
-        ren[f"{prefix}_{amt_col}_txn_count"] = f"{prefix}_txn_count"
-    got = got.rename(columns=ren)
-
-    got.index.name = "acct"
-    return got
+    q = df.groupby(key, sort=False)[amt_col].quantile([0.5, 0.9, 0.99]).unstack()
+    q.columns = [f"{prefix}_amt_p{int(qv*100)}" for qv in q.columns]
+    return basic.join(q, how="left")
 
 
-# -----------------------
-# 邏輯主體
-# -----------------------
+# ============ 主流程 ============
 def build_account_features(
     txns_path: str = "dataset/acct_transaction.csv",
     out_path: str = "feature_data/account_features.csv",
-    alerts_path: Optional[str] = "dataset/acct_alert.csv",
-    use_gpu: bool = True,
+    date_format: Optional[str] = "%Y-%m-%d",
+    time_format: Optional[str] = "%H:%M:%S",
+    datetime_format: Optional[str] = None,   # 若有單欄位 datetime，可指定格式
+    use_gpu: bool = False,
+    time_stats: bool = False,                # 是否計算昂貴的時間序列特徵
 ) -> pd.DataFrame:
-    """
-    讀取原始交易，輸出帳號層級特徵。
-    • GPU（cuDF）可用時，重度 groupby 全部走 GPU，速度更快。
-    • 弱化昂貴特徵（例如 2-hop），保留「對 alert 的直接連結」與「鄰居中 alert 比例」（可高效完成）。
-    • 針對極度不平衡資料：保留能凸顯異常的比率／稀疏統計（如夜間比率、來源多樣性、出入比例）。
-    """
+
     df = pd.read_csv(txns_path)
+    (from_col, to_col, amt_col,
+     date_col, time_col, dt_col,
+     channel_col, currency_col,
+     from_type, to_type, self_col) = _detect_schema(df)
 
-    # 欄位對齊
-    from_col, to_col, amt_col, date_col, time_col, src_col = _detect_schema(df)
-    ts_col = _build_timestamp(df, date_col, time_col)
+    # 金額 -> float
+    df[amt_col] = pd.to_numeric(df[amt_col], errors="coerce").fillna(0.0).astype("float64")
 
-    # 基礎欄位清理
-    df[amt_col] = pd.to_numeric(df[amt_col], errors="coerce").fillna(0.0)
-    # is_self_txn：若原檔有就用原檔，否則用 from==to 推出
-    if "is_self_txn" in df.columns:
-        is_self_col = "is_self_txn"
-        df[is_self_col] = df[is_self_col].fillna(0).astype(int)
+    # is_self_txn：優先用欄位；否則自己比對 from==to
+    if self_col:
+        df["is_self_txn"] = _coerce_bool01(df[self_col])
     else:
-        is_self_col = "_is_self_txn"
-        df[is_self_col] = (df[from_col].astype(str) == df[to_col].astype(str)).astype(int)
+        df["is_self_txn"] = (df[from_col].astype(str) == df[to_col].astype(str)).astype("int32")
 
-    # 夜間 / 週末
-    if ts_col:
-        hour = df[ts_col].dt.hour
-        dow  = df[ts_col].dt.dayofweek
-        df["_is_night"]   = ((hour >= 22) | (hour < 6)).astype("int32")
-        df["_is_weekend"] = (dow >= 5).astype("int32")
+    # 時間戳
+    ts = _combine_datetime(df, date_col, time_col, dt_col, date_format, time_format, datetime_format)
+    if ts is not None:
+        df["_ts_"] = ts
+        df["hour"] = df["_ts_"].dt.hour
+        df["dow"]  = df["_ts_"].dt.dayofweek
+        df["is_night"]   = ((df["hour"] >= 22) | (df["hour"] < 6)).astype("int32")
+        df["is_weekend"] = (df["dow"] >= 5).astype("int32")
     else:
-        df["_is_night"] = 0
-        df["_is_weekend"] = 0
+        df["is_night"] = 0
+        df["is_weekend"] = 0
 
-    # === 優先嘗試 GPU ===
-    use_gpu = bool(use_gpu and _HAS_CUDF)
-    if use_gpu:
-        gdf = cudf.from_pandas(df[[from_col, to_col, amt_col, is_self_col, "_is_night", "_is_weekend"] + ([src_col] if src_col else [])])
-
-        # 出金（from 分組）
-        out_df = _cdf_group_agg(
-            gdf=gdf,
-            key=from_col,
-            amt_col=amt_col,
-            is_night_col="_is_night",
-            is_wkend_col="_is_weekend",
-            is_self_col=is_self_col,
-            counterparty_col=to_col,
-            src_col=src_col,
-            prefix="out",
-        )
-
-        # 入金（to 分組）
-        in_df = _cdf_group_agg(
-            gdf=gdf.rename(columns={from_col: "_from", to_col: "_to"}),
-            key="_to",
-            amt_col=amt_col,
-            is_night_col="_is_night",
-            is_wkend_col="_is_weekend",
-            is_self_col=is_self_col,
-            counterparty_col="_from",
-            src_col=src_col,
-            prefix="in",
-        )
-
+    # ===== 出金（from）聚合 =====
+    if use_gpu and _HAS_CUDF:
+        out_block = _group_amt_block_gpu(df, from_col, amt_col, "out")
     else:
-        # ===== CPU 後備（含分位數）=====
-        # 出金
-        g_out_amt = df.groupby(from_col, sort=False)[amt_col]
-        out_block = _pd_group_amount_block(g_out_amt, "out")
-        out_extra = pd.DataFrame({
-            "out_night_txn_count":   df.groupby(from_col, sort=False)["_is_night"].sum(),
-            "out_weekend_txn_count": df.groupby(from_col, sort=False)["_is_weekend"].sum(),
-            "out_self_txn_count":    df.groupby(from_col, sort=False)[is_self_col].sum(),
-            "out_unique_to_acct":    df.groupby(from_col, sort=False)[to_col].nunique(),
-        })
-        if src_col:
-            out_extra["out_source_nunique"] = df.groupby(from_col, sort=False)[src_col].nunique()
-        out_df = out_block.join(out_extra, how="left")
-        out_df.index.name = "acct"
+        out_block = _group_amt_block_pd(df, from_col, amt_col, "out")
 
-        # 入金
-        g_in_amt = df.groupby(to_col, sort=False)[amt_col]
-        in_block = _pd_group_amount_block(g_in_amt, "in")
-        in_extra = pd.DataFrame({
-            "in_night_txn_count":   df.groupby(to_col, sort=False)["_is_night"].sum(),
-            "in_weekend_txn_count": df.groupby(to_col, sort=False)["_is_weekend"].sum(),
-            "in_self_txn_count":    df.groupby(to_col, sort=False)[is_self_col].sum(),
-            "in_unique_from_acct":  df.groupby(to_col, sort=False)[from_col].nunique(),
-        })
-        if src_col:
-            in_extra["in_source_nunique"] = df.groupby(to_col, sort=False)[src_col].nunique()
-        in_df = in_block.join(in_extra, how="left")
-        in_df.index.name = "acct"
+    out_extra = pd.DataFrame({
+        "out_night_txn_count":   df.groupby(from_col, sort=False)["is_night"].sum(),
+        "out_weekend_txn_count": df.groupby(from_col, sort=False)["is_weekend"].sum(),
+        "out_self_txn_count":    df.groupby(from_col, sort=False)["is_self_txn"].sum(),
+        "out_unique_to_acct":    df.groupby(from_col, sort=False)[to_col].nunique(),
+    })
+    if channel_col:
+        out_extra["out_channel_nunique"] = df.groupby(from_col, sort=False)[channel_col].nunique()
+    if currency_col:
+        out_extra["out_currency_nunique"] = df.groupby(from_col, sort=False)[currency_col].nunique()
+    if to_type:  # 以對手方型別多樣性當作出金端資訊
+        out_extra["out_counterparty_type_nunique"] = df.groupby(from_col, sort=False)[to_type].nunique()
 
-    # 匯總為帳號層級
-    out_df.index.name = "acct"
-    in_df.index.name  = "acct"
-    feat = out_df.add(in_df, fill_value=0)
+    out_feat = out_block.join(out_extra, how="left")
 
-    # 比率特徵（對不平衡較友善，能凸顯異常行為）
+    # ===== 入金（to）聚合 =====
+    if use_gpu and _HAS_CUDF:
+        in_block = _group_amt_block_gpu(df, to_col, amt_col, "in")
+    else:
+        in_block = _group_amt_block_pd(df, to_col, amt_col, "in")
+
+    in_extra = pd.DataFrame({
+        "in_night_txn_count":   df.groupby(to_col, sort=False)["is_night"].sum(),
+        "in_weekend_txn_count": df.groupby(to_col, sort=False)["is_weekend"].sum(),
+        "in_self_txn_count":    df.groupby(to_col, sort=False)["is_self_txn"].sum(),
+        "in_unique_from_acct":  df.groupby(to_col, sort=False)[from_col].nunique(),
+    })
+    if channel_col:
+        in_extra["in_channel_nunique"] = df.groupby(to_col, sort=False)[channel_col].nunique()
+    if currency_col:
+        in_extra["in_currency_nunique"] = df.groupby(to_col, sort=False)[currency_col].nunique()
+    if from_type:
+        in_extra["in_counterparty_type_nunique"] = df.groupby(to_col, sort=False)[from_type].nunique()
+
+    in_feat = in_block.join(in_extra, how="left")
+
+    # ===== 匯總到帳號 =====
+    out_feat.index.name = "acct"
+    in_feat.index.name = "acct"
+    feat = out_feat.add(in_feat, fill_value=0)
+
+    # ===== 比率特徵 =====
     feat["night_txn_ratio"] = (
         (feat.get("out_night_txn_count", 0) + feat.get("in_night_txn_count", 0)) /
         (feat.get("out_txn_count", 0) + feat.get("in_txn_count", 0) + 1e-9)
@@ -257,44 +222,48 @@ def build_account_features(
     feat["out_in_txn_ratio"] = feat.get("out_txn_count", 0) / (feat.get("in_txn_count", 0) + 1e-9)
     feat["out_in_amt_ratio"] = feat.get("out_amt_sum", 0.0) / (feat.get("in_amt_sum", 0.0) + 1e-9)
 
-    # ===== 與警示帳號的直接關聯（高效版本）=====
-    if alerts_path and Path(alerts_path).exists():
-        alerts = pd.read_csv(alerts_path)
-        if "acct" not in alerts.columns:
-            for c in ["acct_id", "account", "account_id", "id"]:
-                if c in alerts.columns:
-                    alerts = alerts.rename(columns={c: "acct"})
-                    break
-        alert_set = set(alerts["acct"].astype(str).unique())
+    # （可選）時間序列昂貴特徵
+    if time_stats and ("_ts_" in df.columns):
+        def _burstiness_count(ts: pd.Series, window="5min") -> int:
+            s = ts.dropna()
+            if s.empty:
+                return 0
+            s = s.sort_values()
+            ones = pd.Series(1, index=s.values)
+            return int(ones.rolling(window=window).sum().max())
 
-        df["_from_s"] = df[from_col].astype(str)
-        df["_to_s"]   = df[to_col].astype(str)
+        def _interarrival_stats(ts: pd.Series) -> tuple[float, float, float]:
+            s = ts.dropna()
+            if len(s) <= 1:
+                return 0.0, 0.0, 0.0
+            s = s.sort_values().astype("int64") // 10**9
+            diff = np.diff(s.values)
+            mean = float(np.mean(diff))
+            std  = float(np.std(diff))
+            cv   = float(std / (mean + 1e-9))
+            return mean, std, cv
 
-        # 直接連到 alert 的次數（出 / 入）
-        direct_to_alert   = df[df["_to_s"].isin(alert_set)].groupby("_from_s").size().rename("out_to_alert_count")
-        direct_from_alert = df[df["_from_s"].isin(alert_set)].groupby("_to_s").size().rename("in_from_alert_count")
+        g_out_t = df.groupby(from_col, sort=False)["_ts_"]
+        g_in_t  = df.groupby(to_col,   sort=False)["_ts_"]
 
-        # 鄰居中 alert 比例（用 unique 對手方計算）
-        out_neighbors = df.groupby("_from_s")["_to_s"].nunique().rename("out_unique_to_acct2")
-        out_neighbors_alert = df[df["_to_s"].isin(alert_set)].groupby("_from_s")["_to_s"].nunique().rename("out_alert_to_unique")
-        in_neighbors  = df.groupby("_to_s")["_from_s"].nunique().rename("in_unique_from_acct2")
-        in_neighbors_alert = df[df["_from_s"].isin(alert_set)].groupby("_to_s")["_from_s"].nunique().rename("in_alert_from_unique")
+        out_burst = g_out_t.apply(lambda s: _burstiness_count(s)).rename("out_burst_5min_max")
+        in_burst  = g_in_t.apply(lambda s: _burstiness_count(s)).rename("in_burst_5min_max")
 
-        nei = pd.concat([out_neighbors, out_neighbors_alert, in_neighbors, in_neighbors_alert], axis=1).fillna(0)
-        nei["alert_neighbor_ratio_out"] = nei["out_alert_to_unique"] / (nei["out_unique_to_acct2"] + 1e-9)
-        nei["alert_neighbor_ratio_in"]  = nei["in_alert_from_unique"] / (nei["in_unique_from_acct2"] + 1e-9)
-        nei = nei[["alert_neighbor_ratio_out", "alert_neighbor_ratio_in"]]
-        nei.index.name = "acct"
+        out_iat = g_out_t.apply(_interarrival_stats)
+        out_iat = pd.DataFrame(out_iat.tolist(), index=out_iat.index,
+                               columns=["out_iat_mean_s", "out_iat_std_s", "out_iat_cv"])
+        in_iat = g_in_t.apply(_interarrival_stats)
+        in_iat = pd.DataFrame(in_iat.tolist(), index=in_iat.index,
+                              columns=["in_iat_mean_s", "in_iat_std_s", "in_iat_cv"])
 
-        # 併入
-        direct_to_alert.index.name = "acct"
-        direct_from_alert.index.name = "acct"
-        feat = feat.join(direct_to_alert, how="left").join(direct_from_alert, how="left").join(nei, how="left")
-        for c in ["out_to_alert_count", "in_from_alert_count", "alert_neighbor_ratio_out", "alert_neighbor_ratio_in"]:
+        feat = feat.join(out_burst, how="left").join(in_burst, how="left").join(out_iat, how="left").join(in_iat, how="left")
+        for c in ["out_burst_5min_max", "in_burst_5min_max",
+                  "out_iat_mean_s", "out_iat_std_s", "out_iat_cv",
+                  "in_iat_mean_s", "in_iat_std_s", "in_iat_cv"]:
             if c in feat.columns:
                 feat[c] = feat[c].fillna(0)
 
-    # 清理 & 輸出
+    # 數值清理與輸出
     feat = feat.reset_index()
     num_cols = feat.select_dtypes(include=[np.number]).columns
     feat[num_cols] = feat[num_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -302,20 +271,20 @@ def build_account_features(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     feat.to_csv(out_path, index=False, encoding="utf-8")
-    print(f"✅ 已輸出特徵檔：{out_path}  （{feat.shape[0]} rows, {feat.shape[1]} cols）")
-
+    print(f"✅ 已輸出特徵：{out_path}  （{feat.shape[0]} rows, {feat.shape[1]} cols）")
     return feat
 
 
-# -----------------------
-# CLI
-# -----------------------
+# ============ CLI ============
 def parse_args():
     p = argparse.ArgumentParser(description="Build account-level features from acct_transaction.csv")
-    p.add_argument("--txns", default="dataset/acct_transaction.csv")
-    p.add_argument("--out",  default="feature_data/account_features.csv")
-    p.add_argument("--alerts", default="dataset/acct_alert.csv")
-    p.add_argument("--no-gpu", action="store_true", help="強制使用 CPU（關閉 cuDF）")
+    p.add_argument("--txns", default="dataset/acct_transaction.csv", help="交易 CSV 路徑")
+    p.add_argument("--out",  default="feature_data/account_features.csv", help="輸出特徵 CSV 路徑")
+    p.add_argument("--date-format", default="%Y-%m-%d", help="txn_date 的格式（建議提供以避免警告）")
+    p.add_argument("--time-format", default="%H:%M:%S", help="txn_time 的格式")
+    p.add_argument("--datetime-format", default=None, help="若使用單欄位 datetime（如 txn_datetime），可指定格式")
+    p.add_argument("--gpu", action="store_true", help="若環境有 cuDF，啟用 GPU 加速 groupby")
+    p.add_argument("--time-stats", action="store_true", help="計算爆發度/到達間隔（較慢，預設關閉）")
     return p.parse_args()
 
 
@@ -324,8 +293,11 @@ def main():
     build_account_features(
         txns_path=args.txns,
         out_path=args.out,
-        alerts_path=args.alerts,
-        use_gpu=not args.no_gpu,   # 預設開 GPU（若安裝 cuDF）
+        date_format=args.date_format,
+        time_format=args.time_format,
+        datetime_format=args.datetime_format,
+        use_gpu=(args.gpu and _HAS_CUDF),
+        time_stats=args.time_stats,
     )
 
 
